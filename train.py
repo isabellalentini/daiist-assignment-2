@@ -10,7 +10,7 @@ Assignment 2: training pipeline.
 Steps:
 
 1. Download joseph-nelson/hard-hat-workers v5 from Roboflow Universe.
-2. Finetune yolo11s from the pretrained COCO checkpoint, copy the best epoch to
+2. Finetune yolo11n from the pretrained COCO checkpoint, copy the best epoch to
    weights/best.pt.
 3. Evaluate on the test split: overall and per-class detection metrics, and
    the detection confusion matrix.
@@ -42,12 +42,15 @@ WORKSPACE, PROJECT, VERSION = "joseph-nelson", "hard-hat-workers", 5
 DATA_DIR = ROOT / "datasets" / f"{PROJECT}-{VERSION}"
 POSITIVE_CLASS = "head"
 
-BASE_MODEL = "yolo11s.pt"
-EPOCHS = 50
+# Sized to train on a laptop CPU (Apple M2) in a few hours. 416 is close to the
+# images' native width of about 500 px, so little detail is lost.
+BASE_MODEL = "yolo11n.pt"
+EPOCHS = 10
 PATIENCE = 15
-IMGSZ = 640
+IMGSZ = 416
 BATCH = 16
 SEED = 0
+CONFUSION_CONF = 0.25
 
 QUICK = os.environ.get("QUICK") == "1"
 if QUICK:
@@ -133,8 +136,26 @@ def evaluate_detection(data_yaml: Path) -> dict:
             "ap50_95": float(box.ap[i]),
             "instances": int(instances[i]) if instances is not None else None,
         }
-    for plot in ["confusion_matrix.png", "confusion_matrix_normalized.png", "BoxPR_curve.png"]:
-        source = Path(metrics.save_dir) / plot
+    # AP needs every box, but a confusion matrix built from boxes down to
+    # conf 0.001 mostly counts guesses no threshold would keep. Rebuild it at
+    # the usual 0.25 instead.
+    at_conf = model.val(
+        data=str(data_yaml),
+        split="test",
+        imgsz=IMGSZ,
+        batch=BATCH,
+        conf=CONFUSION_CONF,
+        project=str(ROOT / "runs"),
+        name="test_conf",
+        exist_ok=True,
+    )
+    plots = {
+        "BoxPR_curve.png": metrics.save_dir,
+        "confusion_matrix.png": at_conf.save_dir,
+        "confusion_matrix_normalized.png": at_conf.save_dir,
+    }
+    for plot, folder in plots.items():
+        source = Path(folder) / plot
         if source.exists():
             shutil.copy(source, ARTIFACTS / plot)
     return {
@@ -144,7 +165,8 @@ def evaluate_detection(data_yaml: Path) -> dict:
         "confusion_matrix": {
             "labels": names + ["background"],
             "orientation": "rows are predicted class, columns are true class",
-            "matrix": metrics.confusion_matrix.matrix.astype(int).tolist(),
+            "confidence": CONFUSION_CONF,
+            "matrix": at_conf.confusion_matrix.matrix.astype(int).tolist(),
         },
     }
 
@@ -260,11 +282,15 @@ def main() -> None:
     }
     metrics_path.write_text(json.dumps(metrics, indent=2))
 
+    low, high, band_cost = costs.best_band(finetuned_scores, labels)
+    band_shares = costs.outcome_shares(finetuned_scores, labels, low, high)
+    review_share = costs.review_share(band_shares)
+
     assumptions = {
         name: getattr(costs, name)
         for name in [
             "BASE_RATE", "COST_FP", "COST_FN", "COST_TP", "COST_TN", "REVIEW_COST",
-            "REVIEWER_ACCURACY", "CASES_PER_DAY",
+            "REVIEWER_ACCURACY", "GUARD_COST_PER_CASE", "CASES_PER_DAY",
         ]
     }
     (ARTIFACTS / "operating_point.json").write_text(json.dumps({
@@ -272,6 +298,14 @@ def main() -> None:
         "cost_per_1000": float(best["cost_per_1000"]),
         "recall": float(best["recall"]),
         "false_positive_rate": float(best["false_positive_rate"]),
+        "review_band": {
+            "low": low,
+            "high": high,
+            "cost_per_1000": 1000 * band_cost,
+            "review_share": review_share,
+            "reviews_per_day": review_share * costs.CASES_PER_DAY,
+            "shares": {k: float(v) for k, v in band_shares.items()},
+        },
         "assumptions": assumptions,
     }, indent=2))
 
@@ -281,6 +315,10 @@ def main() -> None:
     for name, row in detection["per_class"].items():
         print(f"  {name:7s} P {row['precision']:.3f}  R {row['recall']:.3f}  AP50 {row['ap50']:.3f}")
     print(f"Cheapest threshold {chosen:.2f}: {best['cost_per_1000']:.0f} EUR per 1,000 gate passes")
+    print(
+        f"Cheapest review band: pass below {low:.2f}, fail at or above {high:.2f}: "
+        f"{1000 * band_cost:.0f} EUR per 1,000, {review_share:.1%} to review"
+    )
     print(pd.DataFrame(image_level).T.round(3).to_string())
     print("=" * 72)
 

@@ -28,21 +28,25 @@ import pandas as pd
 BASE_RATE = 0.03
 
 # Euros per case for each outcome when the model decides alone.
-# Placeholders from the framing in REPORT.md, finalised in the cost section.
-COST_FP = 1.5   # worker with a hard hat stopped at the gate
-COST_FN = 75.0  # worker without a hard hat let onto the site
-COST_TP = 0.0   # worker without a hard hat stopped (they would lose this time anyway)
+COST_FP = 0.70  # 1 min of the worker + 30 s of the supervisor at 26.51 EUR/h (INE Q4 2025)
+COST_FN = 25.0  # injury, fine and site stoppage risk plus a safety culture allowance, see REPORT.md
+COST_TP = 2.50  # worker walks back for a hard hat, about 5 min, plus 30 s of the supervisor
 COST_TN = 0.0   # worker with a hard hat walks in
 
-# Human review of a snapshot. Placeholders, finalised in the review section.
+# Human review of a snapshot: the supervisor looks at it for about 15 s while
+# the worker waits at the gate for the verdict.
 REVIEW_SECONDS = 15
 SUPERVISOR_HOURLY_EUR = 30.0
-REVIEW_COST = REVIEW_SECONDS / 3600 * SUPERVISOR_HOURLY_EUR
-REVIEWER_ACCURACY = 1.0  # share of reviewed cases the supervisor gets right
+WORKER_HOURLY_EUR = 26.51  # INE Q4 2025, average labour cost per hour worked
+REVIEW_COST = REVIEW_SECONDS / 3600 * (SUPERVISOR_HOURLY_EUR + WORKER_HOURLY_EUR)
+REVIEWER_ACCURACY = 0.95  # share of reviewed cases the supervisor gets right
 
 # Gate volume, used to turn shares into people.
 CASES_PER_DAY = 600
-WORK_SECONDS_PER_DAY = 8 * 3600
+SHIFT_HOURS = 8
+
+# A person checking everyone has to stand at the gate for the whole shift.
+GUARD_COST_PER_CASE = SHIFT_HOURS * WORKER_HOURLY_EUR / CASES_PER_DAY
 
 THRESHOLDS = np.round(np.linspace(0.0, 1.0, 101), 2)
 
@@ -85,24 +89,47 @@ def outcome_counts(
     )
 
 
-def cost_per_case(shares: dict[str, float], base_rate: float = BASE_RATE) -> float:
+def cost_per_case(
+    shares: dict[str, float],
+    base_rate: float = BASE_RATE,
+    review_cost: float | None = None,
+) -> float:
     """Expected euros per gate pass at the gate's base rate.
 
-    A reviewed case costs the supervisor's time, and then the supervisor's
-    decision: right with probability REVIEWER_ACCURACY, wrong otherwise.
+    A reviewed case costs review_cost (REVIEW_COST unless given), and then the
+    person's decision: right with probability REVIEWER_ACCURACY, wrong otherwise.
     """
+    review_cost = REVIEW_COST if review_cost is None else review_cost
     right, wrong = REVIEWER_ACCURACY, 1 - REVIEWER_ACCURACY
     positive = (
         shares["pos_pass"] * COST_FN
         + shares["pos_fail"] * COST_TP
-        + shares["pos_review"] * (REVIEW_COST + right * COST_TP + wrong * COST_FN)
+        + shares["pos_review"] * (review_cost + right * COST_TP + wrong * COST_FN)
     )
     negative = (
         shares["neg_pass"] * COST_TN
         + shares["neg_fail"] * COST_FP
-        + shares["neg_review"] * (REVIEW_COST + right * COST_TN + wrong * COST_FP)
+        + shares["neg_review"] * (review_cost + right * COST_TN + wrong * COST_FP)
     )
     return base_rate * positive + (1 - base_rate) * negative
+
+
+# The two reference policies with no model, as outcome shares.
+NOBODY_CHECKED = dict(pos_pass=1, pos_review=0, pos_fail=0, neg_pass=1, neg_review=0, neg_fail=0)
+EVERYONE_CHECKED = dict(pos_pass=0, pos_review=1, pos_fail=0, neg_pass=0, neg_review=1, neg_fail=0)
+
+
+def best_band(
+    scores: np.ndarray, labels: np.ndarray, base_rate: float = BASE_RATE
+) -> tuple[float, float, float]:
+    """Cheapest (low, high) pair on the THRESHOLDS grid, and its cost per case."""
+    best = (np.inf, 0.0, 0.0)
+    for i, low in enumerate(THRESHOLDS):
+        for high in THRESHOLDS[i:]:
+            cost = cost_per_case(outcome_shares(scores, labels, low, high), base_rate)
+            if cost < best[0] - 1e-12:
+                best = (cost, float(low), float(high))
+    return best[1], best[2], best[0]
 
 
 def review_share(shares: dict[str, float], base_rate: float = BASE_RATE) -> float:
